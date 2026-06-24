@@ -133,3 +133,129 @@ class KGStore:
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j 清理孤立节点失败: %s", e)
+
+    def search(self, query_text: str, top_k: int) -> List[GraphSearchResult]:
+        """根据查询文本抽取实体，执行 1~2 跳子图遍历，返回关联的 ChunkID。"""
+        if not self.available():
+            return []
+        extracted = self.extractor.extract(query_text)
+        if not extracted.entities:
+            return []
+
+        names = [e.name for e in extracted.entities]
+        hops = self.max_hops
+        if hops <= 0:
+            hops = 2
+        if hops > 3:
+            hops = 3
+
+        query = """
+        	MATCH (e:Entity) WHERE e.name IN $names
+        	CALL apoc.path.subgraphNodes(e, {
+        	  maxLevel: $hops,
+        	  relationshipFilter: "RELATES_TO|PART_OF|CAUSES|DESCRIBES|MENTIONS|WORKS_FOR|LOCATED_IN"
+        	})
+        	YIELD node AS neighbor
+        	WHERE neighbor:Entity AND neighbor.chunk_id IS NOT NULL
+        	WITH e.name AS seed, neighbor.name AS nb, neighbor.chunk_id AS cid,
+        	     COALESCE(neighbor.pg_id, 0) AS pgid,
+        	     toInteger(apoc.node.degree(neighbor)) AS degree
+        	RETURN cid, pgid, collect(DISTINCT seed) AS seeds, collect(DISTINCT nb) AS neighbors, max(degree) AS deg
+        	ORDER BY size(seeds) DESC, deg DESC
+        	LIMIT $limit"""
+
+        try:
+            records = self.neo4j.run_cypher(query,{
+                "names": names,
+                "hops": int(hops),
+                "limit": int(top_k * 3),
+            })
+        except Exception as e:
+            # APOC 不可用时降级为直接节点匹配
+            return self._search_direct(names, top_k)
+
+        raw: List[dict] = []
+        for rec in records or []:
+            cid = _to_int(rec.get("cid"))
+            if cid < 0:
+                continue
+            raw.append({
+                "chunk_id": cid,
+                "pg_id": _to_int64(rec.get("pgid")),
+                "seeds": _to_string_list(rec.get("seeds")),
+                "neighbors": _to_string_list(rec.get("neighbors")),
+                "degree": _to_int64(rec.get("deg")),
+            })
+
+        seen: set = set()
+        results: List[GraphSearchResult] = []
+        for r in raw:
+            pg_id = r["pg_id"]
+            if pg_id == 0 or pg_id in seen:  # 没有 pg_id 的节点（旧数据）跳过
+                continue
+            seen.add(pg_id)
+            score = float(len(r["seeds"])) * 0.6 + float(r["degree"]) * 0.01
+            score *= self.kg_weight
+            results.append(GraphSearchResult(
+                chunk_id=r["chunk_id"],
+                pg_id=pg_id,
+                score=score,
+                entities=r["seeds"],
+                hop_path=r["neighbors"],
+            ))
+        results.sort(key=lambda x: x.score, reverse=True)
+        if len(results) > top_k:
+            results = results[:top_k]
+        return results
+
+    def _search_direct(self, names: List[str], top_k: int) -> List[GraphSearchResult]:
+        """APOC 不可用时的降级版本：直接匹配实体所在 chunk"""
+        try:
+            records = self.neo4j.run_cypher(
+                "MATCH (e:Entity) WHERE e.name IN $names AND e.chunk_id IS NOT NULL "
+                "RETURN e.chunk_id AS cid, COALESCE(e.pg_id, 0) AS pgid, e.name AS name "
+                "ORDER BY cid LIMIT $limit",
+                {"names": names, "limit": int(top_k)},
+            )
+        except Exception:
+            return []
+        seen: set = set()
+        results: List[GraphSearchResult] = []
+        for rec in records or []:
+            cid = _to_int(rec.get("cid"))
+            pg_id = _to_int64(rec.get("pgid"))
+            name = _to_string(rec.get("name"))
+            if pg_id == 0 or pg_id in seen:
+                continue
+            seen.add(pg_id)
+            results.append(GraphSearchResult(
+                chunk_id=cid,
+                pg_id=pg_id,
+                score=self.kg_weight,
+                entities=[name],
+            ))
+        return results
+
+    def _to_int(v) -> int:
+        if isinstance(v, bool):
+            return -1
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        return -1
+
+    def _to_int64(v) -> int:
+        if isinstance(v, bool):
+            return 0
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        return 0
+
+    def _to_string_list(v) -> List[str]:
+        if isinstance(v, list):
+            return [a for a in v if isinstance(a, str)]
+        return []
+
